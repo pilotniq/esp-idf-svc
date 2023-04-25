@@ -11,7 +11,7 @@ use alloc::sync::Arc;
 
 use embedded_svc::eth::*;
 
-use esp_idf_hal::peripheral::{Peripheral, PeripheralRef};
+use esp_idf_hal::peripheral::Peripheral;
 
 #[cfg(any(
     all(esp32, esp_idf_eth_use_esp32_emac),
@@ -156,9 +156,25 @@ enum Status {
     Disconnected,
 }
 
-pub struct EthDriver<'d> {
-    spi_bus: Option<spi_host_device_t>,
-    spi_device: Option<spi_device_handle_t>,
+pub struct RmiiEth;
+
+pub struct OpenEth;
+
+pub struct SpiEth<T> {
+    _driver: T,
+    device: Option<spi_device_handle_t>,
+}
+
+impl<T> Drop for SpiEth<T> {
+    fn drop(&mut self) {
+        if let Some(device) = self.device {
+            esp!(unsafe { spi_bus_remove_device(device) }).unwrap();
+        }
+    }
+}
+
+pub struct EthDriver<'d, T> {
+    _flavor: T,
     handle: esp_eth_handle_t,
     status: Arc<mutex::Mutex<Status>>,
     _subscription: EspSubscription<System>,
@@ -167,10 +183,49 @@ pub struct EthDriver<'d> {
 }
 
 #[cfg(all(esp32, esp_idf_eth_use_esp32_emac))]
-impl<'d> EthDriver<'d> {
+impl<'d> EthDriver<'d, RmiiEth> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mac: impl Peripheral<P = esp_idf_hal::mac::MAC> + 'd,
+        rmii_rdx0: impl Peripheral<P = gpio::Gpio25> + 'd,
+        rmii_rdx1: impl Peripheral<P = gpio::Gpio26> + 'd,
+        rmii_crs_dv: impl Peripheral<P = gpio::Gpio27> + 'd,
+        rmii_mdc: impl Peripheral<P = impl gpio::OutputPin> + 'd,
+        rmii_txd1: impl Peripheral<P = gpio::Gpio22> + 'd,
+        rmii_tx_en: impl Peripheral<P = gpio::Gpio21> + 'd,
+        rmii_txd0: impl Peripheral<P = gpio::Gpio19> + 'd,
+        rmii_mdio: impl Peripheral<P = impl gpio::InputPin + gpio::OutputPin> + 'd,
+        rmii_ref_clk_config: RmiiClockConfig<
+            impl Peripheral<P = gpio::Gpio0> + 'd,
+            impl Peripheral<P = gpio::Gpio16> + 'd,
+            impl Peripheral<P = gpio::Gpio17> + 'd,
+        >,
+        rst: Option<impl Peripheral<P = impl gpio::OutputPin> + 'd>,
+        chipset: RmiiEthChipset,
+        phy_addr: Option<u32>,
+        sysloop: EspSystemEventLoop,
+    ) -> Result<Self, EspError> {
+        Self::new_rmii(
+            mac,
+            rmii_rdx0,
+            rmii_rdx1,
+            rmii_crs_dv,
+            rmii_mdc,
+            rmii_txd1,
+            rmii_tx_en,
+            rmii_txd0,
+            rmii_mdio,
+            rmii_ref_clk_config,
+            rst,
+            chipset,
+            phy_addr,
+            sysloop,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_rmii(
-        mac: impl Peripheral<P = esp_idf_hal::mac::MAC> + 'd,
+        _mac: impl Peripheral<P = esp_idf_hal::mac::MAC> + 'd,
         _rmii_rdx0: impl Peripheral<P = gpio::Gpio25> + 'd,
         _rmii_rdx1: impl Peripheral<P = gpio::Gpio26> + 'd,
         _rmii_crs_dv: impl Peripheral<P = gpio::Gpio27> + 'd,
@@ -189,17 +244,15 @@ impl<'d> EthDriver<'d> {
         phy_addr: Option<u32>,
         sysloop: EspSystemEventLoop,
     ) -> Result<Self, EspError> {
-        esp_idf_hal::into_ref!(mac, rmii_mdc, rmii_mdio);
+        esp_idf_hal::into_ref!(rmii_mdc, rmii_mdio);
 
         let rst = rst.map(|rst| rst.into_ref().pin());
 
         let eth = Self::init(
-            mac,
             Self::rmii_mac(rmii_mdc.pin(), rmii_mdio.pin(), &rmii_ref_clk_config),
             Self::rmii_phy(chipset, rst, phy_addr)?,
             None,
-            None,
-            None,
+            RmiiEth {},
             sysloop,
         )?;
 
@@ -268,20 +321,23 @@ impl<'d> EthDriver<'d> {
 }
 
 #[cfg(esp_idf_eth_use_openeth)]
-impl<'d> EthDriver<'d> {
-    pub fn new_openeth(
+impl<'d> EthDriver<'d, OpenEth> {
+    pub fn new(
         mac: impl Peripheral<P = esp_idf_hal::mac::MAC> + 'd,
         sysloop: EspSystemEventLoop,
     ) -> Result<Self, EspError> {
-        esp_idf_hal::into_ref!(mac);
+        Self::new_openeth(mac, sysloop)
+    }
 
+    pub fn new_openeth(
+        _mac: impl Peripheral<P = esp_idf_hal::mac::MAC> + 'd,
+        sysloop: EspSystemEventLoop,
+    ) -> Result<Self, EspError> {
         let eth = Self::init(
-            mac,
             unsafe { esp_eth_mac_new_openeth(&Self::eth_mac_default_config(0, 0)) },
             unsafe { esp_eth_phy_new_dp83848(&Self::eth_phy_default_config(None, None)) },
             None,
-            None,
-            None,
+            OpenEth {},
             sysloop,
         )?;
 
@@ -294,14 +350,13 @@ impl<'d> EthDriver<'d> {
     esp_idf_eth_spi_ethernet_w5500,
     esp_idf_eth_spi_ethernet_ksz8851snl
 ))]
-impl<'d> EthDriver<'d> {
-    pub fn new_spi<P: spi::Spi + 'd>(
-        spi: impl Peripheral<P = P> + 'd,
+impl<'d, T> EthDriver<'d, SpiEth<T>>
+where
+    T: core::borrow::Borrow<spi::SpiDriver<'d>>,
+{
+    pub fn new(
+        driver: T,
         int: impl Peripheral<P = impl gpio::InputPin> + 'd,
-        sclk: impl Peripheral<P = impl gpio::OutputPin> + 'd,
-        sdo: impl Peripheral<P = impl gpio::OutputPin> + 'd,
-        sdi: impl Peripheral<P = impl gpio::InputPin + gpio::OutputPin> + 'd,
-        dma: esp_idf_hal::spi::Dma,
         cs: Option<impl Peripheral<P = impl gpio::OutputPin> + 'd>,
         rst: Option<impl Peripheral<P = impl gpio::OutputPin> + 'd>,
         chipset: SpiEthChipset,
@@ -310,42 +365,53 @@ impl<'d> EthDriver<'d> {
         phy_addr: Option<u32>,
         sysloop: EspSystemEventLoop,
     ) -> Result<Self, EspError> {
-        esp_idf_hal::into_ref!(spi, int, sclk, sdo, sdi);
+        Self::new_spi(
+            driver, int, cs, rst, chipset, baudrate, mac_addr, phy_addr, sysloop,
+        )
+    }
 
-        let (mac, phy, spi_device) = Self::init_spi::<P>(
+    pub fn new_spi(
+        driver: T,
+        int: impl Peripheral<P = impl gpio::InputPin> + 'd,
+        cs: Option<impl Peripheral<P = impl gpio::OutputPin> + 'd>,
+        rst: Option<impl Peripheral<P = impl gpio::OutputPin> + 'd>,
+        chipset: SpiEthChipset,
+        baudrate: Hertz,
+        mac_addr: Option<&[u8; 6]>,
+        phy_addr: Option<u32>,
+        sysloop: EspSystemEventLoop,
+    ) -> Result<Self, EspError> {
+        esp_idf_hal::into_ref!(int);
+
+        let (mac, phy, device) = Self::init_spi(
+            driver.borrow().host(),
             chipset,
             baudrate,
             int.pin(),
-            sclk.pin(),
-            sdo.pin(),
-            sdi.pin(),
-            dma,
             cs.map(|pin| pin.into_ref().pin()),
             rst.map(|pin| pin.into_ref().pin()),
             phy_addr,
         )?;
 
         let eth = Self::init(
-            spi,
             mac,
             phy,
             mac_addr,
-            Some(P::device()),
-            spi_device,
+            SpiEth {
+                _driver: driver,
+                device,
+            },
             sysloop,
         )?;
 
         Ok(eth)
     }
 
-    fn init_spi<P: spi::Spi>(
+    fn init_spi(
+        host: spi_host_device_t,
         chipset: SpiEthChipset,
         baudrate: Hertz,
         int: i32,
-        sclk: i32,
-        sdo: i32,
-        sdi: i32,
-        dma: esp_idf_hal::spi::Dma,
         cs: Option<i32>,
         rst: Option<i32>,
         phy_addr: Option<u32>,
@@ -357,10 +423,10 @@ impl<'d> EthDriver<'d> {
         ),
         EspError,
     > {
-        Self::init_spi_bus::<P>(sclk, sdo, sdi, dma)?;
+        unsafe { gpio_install_isr_service(0) };
 
-        let mac_cfg = EthDriver::eth_mac_default_config(0, 0);
-        let phy_cfg = EthDriver::eth_phy_default_config(rst.map(|pin| pin), phy_addr);
+        let mac_cfg = Self::eth_mac_default_config(0, 0);
+        let phy_cfg = Self::eth_phy_default_config(rst.map(|pin| pin), phy_addr);
 
         let (mac, phy, spi_handle) = match chipset {
             #[cfg(esp_idf_eth_spi_ethernet_dm9051)]
@@ -368,7 +434,7 @@ impl<'d> EthDriver<'d> {
                 let spi_devcfg = Self::get_spi_conf(cs, 1, 7, baudrate);
 
                 #[cfg(esp_idf_version_major = "4")]
-                let spi_handle = Some(Self::init_spi_device::<P>(&spi_devcfg)?);
+                let spi_handle = Some(Self::init_spi_device(host, &spi_devcfg)?);
 
                 #[cfg(not(esp_idf_version_major = "4"))]
                 let spi_handle = None;
@@ -396,7 +462,7 @@ impl<'d> EthDriver<'d> {
                 let spi_devcfg = Self::get_spi_conf(cs, 16, 8, baudrate);
 
                 #[cfg(esp_idf_version_major = "4")]
-                let spi_handle = Some(Self::init_spi_device::<P>(&spi_devcfg)?);
+                let spi_handle = Some(Self::init_spi_device(host, &spi_devcfg)?);
 
                 #[cfg(not(esp_idf_version_major = "4"))]
                 let spi_handle = None;
@@ -424,7 +490,7 @@ impl<'d> EthDriver<'d> {
                 let spi_devcfg = Self::get_spi_conf(cs, 0, 0, baudrate);
 
                 #[cfg(esp_idf_version_major = "4")]
-                let spi_handle = Some(Self::init_spi_device::<P>(&spi_devcfg)?);
+                let spi_handle = Some(Self::init_spi_device(host, &spi_devcfg)?);
 
                 #[cfg(not(esp_idf_version_major = "4"))]
                 let spi_handle = None;
@@ -470,81 +536,24 @@ impl<'d> EthDriver<'d> {
     }
 
     #[cfg(esp_idf_version_major = "4")]
-    fn init_spi_device<P: spi::Spi>(
+    fn init_spi_device(
+        host: spi_host_device_t,
         conf: &spi_device_interface_config_t,
     ) -> Result<spi_device_handle_t, EspError> {
         let mut spi_handle: spi_device_handle_t = ptr::null_mut();
 
-        esp!(unsafe { spi_bus_add_device(P::device(), conf, &mut spi_handle) })?;
+        esp!(unsafe { spi_bus_add_device(host, conf, &mut spi_handle) })?;
 
         Ok(spi_handle)
     }
-
-    fn init_spi_bus<P: spi::Spi>(
-        sclk: i32,
-        sdo: i32,
-        sdi: i32,
-        dma: esp_idf_hal::spi::Dma,
-    ) -> Result<(), EspError> {
-        unsafe { gpio_install_isr_service(0) };
-
-        #[cfg(not(esp_idf_version = "4.3"))]
-        let bus_config = spi_bus_config_t {
-            flags: SPICOMMON_BUSFLAG_MASTER,
-            sclk_io_num: sclk,
-
-            data4_io_num: -1,
-            data5_io_num: -1,
-            data6_io_num: -1,
-            data7_io_num: -1,
-            __bindgen_anon_1: spi_bus_config_t__bindgen_ty_1 {
-                mosi_io_num: sdo,
-                //data0_io_num: -1,
-            },
-            __bindgen_anon_2: spi_bus_config_t__bindgen_ty_2 {
-                miso_io_num: sdi,
-                //data1_io_num: -1,
-            },
-            __bindgen_anon_3: spi_bus_config_t__bindgen_ty_3 {
-                quadwp_io_num: -1,
-                //data2_io_num: -1,
-            },
-            __bindgen_anon_4: spi_bus_config_t__bindgen_ty_4 {
-                quadhd_io_num: -1,
-                //data3_io_num: -1,
-            },
-            max_transfer_sz: dma.max_transfer_size() as _,
-            ..Default::default()
-        };
-
-        #[cfg(esp_idf_version = "4.3")]
-        let bus_config = spi_bus_config_t {
-            flags: SPICOMMON_BUSFLAG_MASTER,
-            sclk_io_num: sclk,
-
-            mosi_io_num: sdo,
-            miso_io_num: sdi,
-            quadwp_io_num: -1,
-            quadhd_io_num: -1,
-
-            max_transfer_sz: dma.max_transfer_size() as _,
-            ..Default::default()
-        };
-
-        esp!(unsafe { spi_bus_initialize(P::device(), &bus_config, dma.into()) })?;
-
-        Ok(())
-    }
 }
 
-impl<'d> EthDriver<'d> {
-    fn init<P>(
-        _peripheral: PeripheralRef<'d, P>,
+impl<'d, T> EthDriver<'d, T> {
+    fn init(
         mac: *mut esp_eth_mac_t,
         phy: *mut esp_eth_phy_t,
         mac_addr: Option<&[u8; 6]>,
-        spi_bus: Option<spi_host_device_t>,
-        spi_device: Option<spi_device_handle_t>,
+        flavor: T,
         sysloop: EspSystemEventLoop,
     ) -> Result<Self, EspError> {
         let cfg = Self::eth_default_config(mac, phy);
@@ -570,8 +579,7 @@ impl<'d> EthDriver<'d> {
 
         let eth = Self {
             handle,
-            spi_bus,
-            spi_device,
+            _flavor: flavor,
             status: waitable,
             _subscription: subscription,
             callback: None,
@@ -689,14 +697,6 @@ impl<'d> EthDriver<'d> {
             esp!(esp_eth_driver_uninstall(self.handle))?;
         }
 
-        if let Some(device) = self.spi_device {
-            esp!(unsafe { spi_bus_remove_device(device) }).unwrap();
-        }
-
-        if let Some(bus) = self.spi_bus {
-            esp!(unsafe { spi_bus_free(bus) }).unwrap();
-        }
-
         info!("Driver deinitialized");
 
         Ok(())
@@ -756,7 +756,7 @@ impl<'d> EthDriver<'d> {
     }
 }
 
-impl<'d> Eth for EthDriver<'d> {
+impl<'d, T> Eth for EthDriver<'d, T> {
     type Error = EspError;
 
     fn start(&mut self) -> Result<(), Self::Error> {
@@ -776,9 +776,9 @@ impl<'d> Eth for EthDriver<'d> {
     }
 }
 
-unsafe impl<'d> Send for EthDriver<'d> {}
+unsafe impl<'d, T> Send for EthDriver<'d, T> {}
 
-impl<'d> Drop for EthDriver<'d> {
+impl<'d, T> Drop for EthDriver<'d, T> {
     fn drop(&mut self) {
         self.clear_all().unwrap();
 
@@ -786,7 +786,7 @@ impl<'d> Drop for EthDriver<'d> {
     }
 }
 
-impl<'d> RawHandle for EthDriver<'d> {
+impl<'d, T> RawHandle for EthDriver<'d, T> {
     type Handle = esp_eth_handle_t;
 
     fn handle(&self) -> Self::Handle {
@@ -795,19 +795,19 @@ impl<'d> RawHandle for EthDriver<'d> {
 }
 
 #[cfg(esp_idf_comp_esp_netif_enabled)]
-pub struct EspEth<'d> {
+pub struct EspEth<'d, T> {
     glue_handle: *mut esp_eth_netif_glue_t,
     netif: EspNetif,
-    driver: EthDriver<'d>,
+    driver: EthDriver<'d, T>,
 }
 
 #[cfg(esp_idf_comp_esp_netif_enabled)]
-impl<'d> EspEth<'d> {
-    pub fn wrap(driver: EthDriver<'d>) -> Result<Self, EspError> {
+impl<'d, T> EspEth<'d, T> {
+    pub fn wrap(driver: EthDriver<'d, T>) -> Result<Self, EspError> {
         Self::wrap_all(driver, EspNetif::new(NetifStack::Eth)?)
     }
 
-    pub fn wrap_all(driver: EthDriver<'d>, netif: EspNetif) -> Result<Self, EspError> {
+    pub fn wrap_all(driver: EthDriver<'d, T>, netif: EspNetif) -> Result<Self, EspError> {
         let mut this = Self {
             driver,
             netif,
@@ -829,11 +829,11 @@ impl<'d> EspEth<'d> {
         Ok(old_netif)
     }
 
-    pub fn driver(&self) -> &EthDriver<'d> {
+    pub fn driver(&self) -> &EthDriver<'d, T> {
         &self.driver
     }
 
-    pub fn driver_mut(&mut self) -> &mut EthDriver<'d> {
+    pub fn driver_mut(&mut self) -> &mut EthDriver<'d, T> {
         &mut self.driver
     }
 
@@ -885,16 +885,16 @@ impl<'d> EspEth<'d> {
 }
 
 #[cfg(esp_idf_comp_esp_netif_enabled)]
-impl<'d> Drop for EspEth<'d> {
+impl<'d, T> Drop for EspEth<'d, T> {
     fn drop(&mut self) {
         self.detach_netif().unwrap();
     }
 }
 
-unsafe impl<'d> Send for EspEth<'d> {}
+unsafe impl<'d, T> Send for EspEth<'d, T> {}
 
 #[cfg(esp_idf_comp_esp_netif_enabled)]
-impl<'d> RawHandle for EspEth<'d> {
+impl<'d, T> RawHandle for EspEth<'d, T> {
     type Handle = *mut esp_eth_netif_glue_t;
 
     fn handle(&self) -> Self::Handle {
@@ -902,7 +902,7 @@ impl<'d> RawHandle for EspEth<'d> {
     }
 }
 
-impl<'d> Eth for EspEth<'d> {
+impl<'d, T> Eth for EspEth<'d, T> {
     type Error = EspError;
 
     fn start(&mut self) -> Result<(), Self::Error> {
